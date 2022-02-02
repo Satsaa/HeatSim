@@ -1,0 +1,257 @@
+#pragma enable_d3d11_debug_symbols
+
+#pragma kernel Step
+#pragma kernel OverwriteIn
+#pragma kernel OverwriteOut
+#pragma kernel ResetInOut
+
+
+// Heat source index (none, cpu, gpu, chipset, psu, ssd1, ssd2, ssd3 ...)
+Texture3D<int> Source;
+struct SourceData {	float Heat; };
+StructuredBuffer<SourceData> sourceData;
+int GetSource(uint3 pos) { return Source[pos]; }
+SourceData GetSourceData(uint3 pos) { return sourceData[GetSource(pos)]; }
+SourceData GetSourceData(int source) { return sourceData[source]; }
+
+// The fan index
+Texture3D<int> Fan;
+struct FanData { float3 TargetVelocity; };
+StructuredBuffer<FanData> fanData;
+int GetFan(uint3 pos) { return Fan[pos]; }
+
+// Ability to move in to this thing
+Texture3D<float> Passability;
+float GetPassability(uint3 pos) { return Passability[pos]; }
+
+// Ability to move in directions
+Texture3D<float3> Movability;
+float3 GetMovability(uint3 pos) { return Movability[pos]; }
+
+// r -> Isobaric volumetric heat capacity
+// g -> Air percentage
+// b -> Thermal conductivity percentage
+Texture3D<float3> HeatModel;
+float GetHeatCapacity(uint3 pos) { return HeatModel[pos].r; }
+float GetAirPct(uint3 pos) { return HeatModel[pos].g; }
+float GetHeatRate(uint3 pos) { return HeatModel[pos].b; }
+
+// rgb -> Velocity
+RWTexture3D<float3> InVelocity;
+RWTexture3D<float3> OutVelocity;
+float3 GetVelocity(uint3 pos) { return InVelocity[pos]; }
+float3 AddVelocity(uint3 pos, float3 value) { return OutVelocity[pos] += value; }
+
+RWTexture3D<float> InAirPressure;
+RWTexture3D<float> OutAirPressure;
+float GetPressure(uint3 pos) { return InAirPressure[pos]; }
+void AddPressure(uint3 pos, float value) { OutAirPressure[pos] += value; }
+
+RWTexture3D<float> InAirTemp;
+RWTexture3D<float> OutAirTemp;
+float GetAirTemp(uint3 pos) { return InAirTemp[pos]; }
+void AddAirTemp(uint3 pos, float value) { OutAirTemp[pos] += value; }
+
+RWTexture3D<float> InMaterialTemp;
+RWTexture3D<float> OutMaterialTemp;
+float GetMatTemp(uint3 pos) { return InMaterialTemp[pos]; }
+void AddMatTemp(uint3 pos, float value) { OutMaterialTemp[pos] += value; }
+
+RWTexture3D<float4> Errors;
+
+#define stepSize 1 // Step size in seconds
+#define blockSize 0.01 // Size of voxels in meters
+#define airHeatCapacity 0.00121
+#define airHeatRate 0.25
+int3 dims;
+
+
+int3 GetNeighborOffset(uint i) {
+	int sign = i % 2 * 2 - 1;
+	return int3(i < 2 ? sign : 0, i < 4 & i > 1 ? sign : 0, i < 6 & i > 3 ? sign : 0);
+}
+
+uint3 GetNeighbor(uint3 id, uint i) { return id + GetNeighborOffset(i); }
+
+// Fake math, fake thermophysics
+float2 HeatTransfer(float temp1, float temp2, float rate1, float rate2, float cap1, float cap2, float contactPct) {
+	float rate = rate1 * rate2 * contactPct;
+	float diff = temp2 - temp1;
+	float weight1 = (temp1 > temp2 ? cap1 : cap2) / (cap1 + cap2);
+	float weight2 = (temp1 > temp2 ? cap2 : cap1) / (cap1 + cap2);
+	return float2(
+		weight2 * diff * rate,
+		-weight1 * diff * rate
+	);
+}
+
+float CalcAirDensity(float temp) {
+	temp += 273.15;
+	float pressure = 100000;
+	float s = 287.058;
+	return pressure / (s * temp) * 0.001;
+}
+
+float AbsMax(float a, float b) {
+	return abs(a) >= abs(b) ? a : b;
+}
+
+float TotalLength(float3 v) {
+	v = abs(v);
+	return v.x + v.y + v.z;
+}
+
+float MaxComp(float3 v) { return max(v.r, max(v.g, v.b)); }
+
+bool IsOut(int3 pos) {
+	bool3 comp1 = pos < 0;
+	bool3 comp2 = pos >= dims;
+	return any(comp1) || any(comp2);
+}
+
+float2 SetR(float2 v, float v2) { v.x = v2; return v; }
+float2 SetG(float2 v, float v2) { v.y = v2; return v; }
+
+float3 SetR(float3 v, float v2) { v.x = v2; return v; }
+float3 SetG(float3 v, float v2) { v.y = v2; return v; }
+float3 SetB(float3 v, float v2) { v.z = v2; return v; }
+
+float4 SetR(float4 v, float v2) { v.x = v2; return v; }
+float4 SetG(float4 v, float v2) { v.y = v2; return v; }
+float4 SetB(float4 v, float v2) { v.z = v2; return v; }
+float4 SetA(float4 v, float v2) { v.w = v2; return v; }
+
+[numthreads(8,8,8)]
+void Step (uint3 id : SV_DispatchThreadID)
+{
+	float heatCap = GetHeatCapacity(id);
+	float heatRate = GetHeatRate(id);
+	float airTemp = GetAirTemp(id);
+	float matTemp = GetMatTemp(id);
+	float airPct = GetAirPct(id);
+	float press = GetPressure(id);
+	float3 vel = GetVelocity(id);
+
+	float matPct = float(1) - airPct;
+	float heatCapAdj = heatCap * matPct;
+	float airHeatCapAdj = airHeatCapacity * airPct;
+
+	float velTotalLength = TotalLength(vel);
+
+
+	float nbrAirTemp = 0;
+	uint nbrAirBlocks = 0;
+
+	float3 pressureGradient = 0;
+
+	for(uint i = 0; i < 6; i++) {
+		int3 nbrOffset = GetNeighborOffset(i);
+		int3 invOffset = -nbrOffset;
+		uint3 nbr = id + nbrOffset;
+
+		bool isOut2 = IsOut(nbr);
+
+		float heatCap2 = isOut2 ? airHeatCapacity : GetHeatCapacity(nbr);
+		float heatRate2 = isOut2 ? airHeatRate : GetHeatRate(nbr);
+		float airTemp2 = isOut2 ? 24 : GetAirTemp(nbr);
+		float matTemp2 = isOut2 ? 24 : GetMatTemp(nbr);
+		float airPct2 = isOut2 ? 1 : GetAirPct(nbr);
+		float press2 = isOut2 ? 1 : GetPressure(nbr);
+		float3 vel2 = isOut2 ? 0 : GetVelocity(nbr);
+
+		float matPct2 = float(1) - airPct2;
+		float heatCapAdj2 = heatCap2 * matPct2;
+		float airHeatCapAdj2 = airHeatCapacity * airPct2;
+
+		float velTotalLength2 = TotalLength(vel2);
+
+		// Heat transfer
+		float airContact = min(airPct, airPct2);
+		float matContact = min(matPct, matPct2);
+		float mixContact = float(1) - airContact - matContact;
+
+		const float m = float(1)/float(3); // Prevents temperature explosions
+		float2 airTransfer = HeatTransfer(airTemp, airTemp2, airHeatRate, airHeatRate, airHeatCapAdj, airHeatCapAdj2, airContact) * m;
+		float2 matTransfer = (heatCapAdj + heatCapAdj2) == 0 ? 0 : HeatTransfer(matTemp, matTemp2, heatRate   , heatRate2  , heatCapAdj   , heatCapAdj2   , matContact) * m;
+		float2 mixTransfer = airPct > airPct2
+						   ? ((airHeatCapAdj + heatCapAdj2) == 0 ? 0 : HeatTransfer(airTemp, matTemp2, airHeatRate, heatRate2  , airHeatCapAdj, heatCapAdj2   , mixContact) * m)
+						   : ((heatCapAdj + airHeatCapAdj2) == 0 ? 0 : HeatTransfer(matTemp, airTemp2, heatRate   , airHeatRate, heatCapAdj   , airHeatCapAdj2, mixContact) * m);
+
+		// TODO! more temp -> more pressure
+		AddAirTemp(id, airTransfer.x + (airPct > airPct2 ? mixTransfer.x : 0));
+		AddMatTemp(id, matTransfer.x + (airPct < airPct2 ? mixTransfer.x : 0));
+		// AddPressure(id, );
+
+		// Movement
+		float velOutward = MaxComp(max(0, float3(nbrOffset) * vel));
+		float velToward = MaxComp(max(0, float3(invOffset) * vel2));
+
+		// Movement may not total more than 1
+		velOutward = min(velOutward, velOutward / velTotalLength);
+		velToward = min(velToward, velToward / velTotalLength2);
+
+		AddAirTemp(id, velOutward * -airTemp);
+		AddAirTemp(id, velToward * airTemp2);
+
+		AddVelocity(id, velOutward * -vel);
+		AddVelocity(id, velToward * vel2);
+
+		AddPressure(id, velOutward * -press);
+		AddPressure(id, velToward * press2);
+
+
+		{
+			float deltaPress = press2 - press;
+			pressureGradient += -deltaPress * nbrOffset;
+		}
+
+		if (airPct2 > 0) {
+			nbrAirTemp += airTemp2;
+			nbrAirBlocks++;
+		}
+	}
+
+//	AddVelocity(id, pressureGradient * 0.01);
+
+	// "Boyancy"
+	{
+		// density diff 0C -> 100C = -0.34178
+		float dens = CalcAirDensity(airTemp);
+		float dens2 = CalcAirDensity(nbrAirTemp / nbrAirBlocks);
+		//                  1   -   0.5
+		float deltaDens = dens2 - dens;
+		AddVelocity(id, float3(0, deltaDens * 100, 0));
+	}
+
+	// Decay?
+	AddVelocity(id, vel * -0.01);
+
+	// Error checks
+}
+
+[numthreads(8,8,8)]
+void OverwriteIn (uint3 id : SV_DispatchThreadID)
+{
+	InVelocity[id] = OutVelocity[id];
+	InAirPressure[id] = OutAirPressure[id];
+	InAirTemp[id] = OutAirTemp[id];
+	InMaterialTemp[id] = OutMaterialTemp[id];
+}
+
+[numthreads(8,8,8)]
+void OverwriteOut (uint3 id : SV_DispatchThreadID)
+{
+	OutVelocity[id] = InVelocity[id];
+	OutAirPressure[id] = InAirPressure[id];
+	OutAirTemp[id] = InAirTemp[id];
+	OutMaterialTemp[id] = InMaterialTemp[id];
+}
+
+[numthreads(8,8,8)]
+void ResetInOut (uint3 id : SV_DispatchThreadID)
+{
+	InVelocity[id] = OutVelocity[id] = float3(0,0,0);
+	InAirPressure[id] = OutAirPressure[id] = 1;
+	InAirTemp[id] = OutAirTemp[id] = 22;
+	InMaterialTemp[id] = OutMaterialTemp[id] = 22;
+}

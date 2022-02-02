@@ -1,0 +1,96 @@
+
+#pragma kernel i_Draw
+
+RWTexture3D<int> i_In;
+int i_Value;
+uint3 Origin;
+
+[numthreads(1,1,1)]
+void i_Draw (uint3 id : SV_DispatchThreadID)
+{
+    i_In[id + Origin] = i_Value;
+}
+
+
+#pragma kernel i2_Draw
+
+RWTexture3D<int> i2_In;
+int i2_Value;
+
+[numthreads(1,1,1)]
+void i2_Draw (uint3 id : SV_DispatchThreadID)
+{
+    i2_In[id + Origin] = i2_Value;
+}
+
+
+#pragma kernel i3_Draw
+
+RWTexture3D<int> i3_In;
+int i3_Value;
+
+[numthreads(1,1,1)]
+void i3_Draw (uint3 id : SV_DispatchThreadID)
+{
+    i3_In[id + Origin] = i3_Value;
+}
+
+
+#pragma kernel i4_Draw
+
+RWTexture3D<int> i4_In;
+int i4_Value;
+
+[numthreads(1,1,1)]
+void i4_Draw (uint3 id : SV_DispatchThreadID)
+{
+    i4_In[id + Origin] = i4_Value;
+}
+
+
+#pragma kernel f_Draw
+
+RWTexture3D<float> f_In;
+float f_Value;
+
+[numthreads(1,1,1)]
+void f_Draw (uint3 id : SV_DispatchThreadID)
+{
+    f_In[id + Origin] = f_Value;
+}
+
+
+#pragma kernel f2_Draw
+
+RWTexture3D<float2> f2_In;
+float2 f2_Value;
+
+[numthreads(1,1,1)]
+void f2_Draw (uint3 id : SV_DispatchThreadID)
+{
+    f2_In[id + Origin] = f2_Value;
+}
+
+
+#pragma kernel f3_Draw
+
+RWTexture3D<float3> f3_In;
+float3 f3_Value;
+
+[numthreads(1,1,1)]
+void f3_Draw (uint3 id : SV_DispatchThreadID)
+{
+    f3_In[id + Origin] = f3_Value;
+}
+
+
+#pragma kernel f4_Draw
+
+RWTexture3D<float4> f4_In;
+float4 f4_Value;
+
+[numthreads(1,1,1)]
+void f4_Draw (uint3 id : SV_DispatchThreadID)
+{
+    f4_In[id + Origin] = f4_Value;
+}
